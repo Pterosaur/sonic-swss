@@ -25,7 +25,6 @@
 #include "crmorch.h"
 #include "countercheckorch.h"
 #include "notifier.h"
-#include "redisclient.h"
 #include "fdborch.h"
 
 extern sai_switch_api_t *sai_switch_api;
@@ -714,6 +713,33 @@ bool PortsOrch::removeSubPort(const string &alias)
 
     m_portList.erase(it);
     return true;
+}
+
+void PortsOrch::updateChildPortsMtu(const Port &p, const uint32_t mtu)
+{
+    if (p.m_type != Port::PHY && p.m_type != Port::LAG)
+    {
+        return;
+    }
+
+    for (const auto &child_port : p.m_child_ports)
+    {
+        Port subp;
+        if (!getPort(child_port, subp))
+        {
+            SWSS_LOG_WARN("Sub interface %s Port object not found", child_port.c_str());
+            continue;
+        }
+
+        subp.m_mtu = mtu;
+        m_portList[child_port] = subp;
+        SWSS_LOG_NOTICE("Sub interface %s inherits mtu change %u from parent port %s", child_port.c_str(), mtu, p.m_alias.c_str());
+
+        if (subp.m_rif_id)
+        {
+            gIntfsOrch->setRouterIntfsMtu(subp);
+        }
+    }
 }
 
 void PortsOrch::setPort(string alias, Port p)
@@ -2318,6 +2344,8 @@ void PortsOrch::doPortTask(Consumer &consumer)
                         {
                             gIntfsOrch->setRouterIntfsMtu(p);
                         }
+                        // Sub interfaces inherit parent physical port mtu
+                        updateChildPortsMtu(p, mtu);
                     }
                     else
                     {
@@ -2578,11 +2606,16 @@ void PortsOrch::doVlanTask(Consumer &consumer)
         {
             // Retrieve attributes
             uint32_t mtu = 0;
+            MacAddress mac;
             for (auto i : kfvFieldsValues(t))
             {
                 if (fvField(i) == "mtu")
                 {
                     mtu = (uint32_t)stoul(fvValue(i));
+                }
+                if (fvField(i) == "mac")
+                {
+                    mac = MacAddress(fvValue(i));
                 }
             }
 
@@ -2615,6 +2648,15 @@ void PortsOrch::doVlanTask(Consumer &consumer)
                     if (vl.m_rif_id)
                     {
                         gIntfsOrch->setRouterIntfsMtu(vl);
+                    }
+                }
+                if (mac)
+                {
+                    vl.m_mac = mac;
+                    m_portList[vlan_alias] = vl;
+                    if (vl.m_rif_id)
+                    {
+                        gIntfsOrch->setRouterIntfsMac(vl);
                     }
                 }
             }
@@ -2847,6 +2889,8 @@ void PortsOrch::doLagTask(Consumer &consumer)
                     {
                         gIntfsOrch->setRouterIntfsMtu(l);
                     }
+                    // Sub interfaces inherit parent LAG mtu
+                    updateChildPortsMtu(l, mtu);
                 }
 
                 if (!learn_mode.empty() && (l.m_learn_mode != learn_mode))
