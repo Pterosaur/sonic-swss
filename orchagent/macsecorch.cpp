@@ -358,7 +358,7 @@ public:
         return m_macsec_sc;
     }
 
-    sai_object_id_t *get_macsec_sa()
+    MACsecSA *get_macsec_sa()
     {
         if (m_macsec_sa == nullptr)
         {
@@ -372,8 +372,8 @@ public:
             {
                 return nullptr;
             }
-            auto an = sc->m_sa_ids.find(*m_an);
-            if (an == sc->m_sa_ids.end())
+            auto an = sc->m_sas.find(*m_an);
+            if (an == sc->m_sas.end())
             {
                 SWSS_LOG_INFO(
                     "Cannot find the MACsec SA %u of SC 0x%" PRIx64 " at the port %s.",
@@ -720,9 +720,34 @@ task_process_status MACsecOrch::taskUpdateEgressSA(
         SWSS_LOG_INFO("The MACsec SC 0x%" PRIx64 " hasn't been created at the port %s.", sci, port_name.c_str());
         return task_need_retry;
     }
+
+    auto &sa = ctx.get_macsec_sc()->m_sas[an];
+    for (auto &attr: sa_attr)
+    {
+        auto itr = find(sa.m_attrs.begin(), sa.m_attrs.end(), fvField(attr));
+        if (itr != sa.m_attrs.end())
+        {
+            sa.m_attrs.erase(itr);
+            if (fvValue(attr) != itr->second)
+            {
+                if (sa.m_active)
+                {
+                    deleteMACsecSA(port_sci_an, SAI_MACSEC_DIRECTION_EGRESS);
+                    sa.m_active = false;
+                }
+            }
+        }
+        sa.m_attrs.push_back(attr);
+    }
+
     if (ctx.get_macsec_sc()->m_encoding_an == an)
     {
-        return createMACsecSA(port_sci_an, sa_attr, SAI_MACSEC_DIRECTION_EGRESS);
+        auto ret = createMACsecSA(port_sci_an, sa_attr, SAI_MACSEC_DIRECTION_EGRESS);
+        if (ret == task_success)
+        {
+            sa.m_active = true;
+        }
+        return ret;
     }
     return task_need_retry;
 }
@@ -732,7 +757,28 @@ task_process_status MACsecOrch::taskDeleteEgressSA(
     const TaskArgs &sa_attr)
 {
     SWSS_LOG_ENTER();
-    return deleteMACsecSA(port_sci_an, SAI_MACSEC_DIRECTION_EGRESS);
+    auto ret = deleteMACsecSA(port_sci_an, SAI_MACSEC_DIRECTION_EGRESS);
+
+    std::string port_name;
+    sai_uint64_t sci = 0;
+    macsec_an_t an = 0;
+    if (!extract_variables(port_sci_an, ':', port_name, sci, an) || an > MAX_SA_NUMBER)
+    {
+        SWSS_LOG_WARN("The key %s isn't correct.", port_sci_an.c_str());
+        return task_failed;
+    }
+
+    MACsecOrchContext ctx(this, port_name, SAI_MACSEC_DIRECTION_EGRESS, sci, an);
+    if (ctx.get_macsec_sc() == nullptr)
+    {
+        SWSS_LOG_INFO("The MACsec SC 0x%" PRIx64 " hasn't been created at the port %s.", sci, port_name.c_str());
+    }
+    else
+    {
+        ctx.get_macsec_sc()->m_sas.erase();
+    }
+
+    return ret;
 }
 
 task_process_status MACsecOrch::taskUpdateIngressSA(
@@ -741,40 +787,65 @@ task_process_status MACsecOrch::taskUpdateIngressSA(
 {
     SWSS_LOG_ENTER();
 
+    std::string port_name;
+    sai_uint64_t sci = 0;
+    macsec_an_t an = 0;
+    if (!extract_variables(port_sci_an, ':', port_name, sci, an) || an > MAX_SA_NUMBER)
+    {
+        SWSS_LOG_WARN("The key %s isn't correct.", port_sci_an.c_str());
+        return task_failed;
+    }
+    MACsecOrchContext ctx(this, port_name, SAI_MACSEC_DIRECTION_INGRESS, sci, an);
+    if (ctx.get_macsec_sc() == nullptr)
+    {
+        SWSS_LOG_INFO("The MACsec SC 0x%" PRIx64 " hasn't been created at the port %s.", sci, port_name.c_str());
+        return task_need_retry;
+    }
+
+    auto &sa = ctx.get_macsec_sc()->m_sas[an];
+    for (auto &attr: sa_attr)
+    {
+        auto itr = find(sa.m_attrs.begin(), sa.m_attrs.end(), fvField(attr));
+        if (itr != sa.m_attrs.end())
+        {
+            sa.m_attrs.erase(itr);
+            if (fvValue(attr) != itr->second)
+            {
+                if (sa.m_active)
+                {
+                    deleteMACsecSA(port_sci_an, SAI_MACSEC_DIRECTION_INGRESS);
+                    sa.m_active = false;
+                }
+            }
+        }
+        sa.m_attrs.push_back(attr);
+    }
+
     swss::AlphaBoolean alpha_boolean = false;
     get_value(sa_attr, "active", alpha_boolean);
     bool active = alpha_boolean.operator bool();
+
+    auto ret = task_success;
     if (active)
     {
-        return createMACsecSA(port_sci_an, sa_attr, SAI_MACSEC_DIRECTION_INGRESS);
+        if (!sa.m_active)
+        {
+            ret = createMACsecSA(port_sci_an, sa.m_attrs, SAI_MACSEC_DIRECTION_INGRESS);
+            if (ret == task_success)
+            {
+                sa.m_active = true;
+            }
+        }
     }
     else
     {
-
-        std::string port_name;
-        sai_uint64_t sci = 0;
-        macsec_an_t an = 0;
-        if (!extract_variables(port_sci_an, ':', port_name, sci, an) || an > MAX_SA_NUMBER)
+        if (sa.m_active)
         {
-            SWSS_LOG_WARN("The key %s isn't correct.", port_sci_an.c_str());
-            return task_failed;
-        }
-
-        MACsecOrchContext ctx(this, port_name, SAI_MACSEC_DIRECTION_INGRESS, sci, an);
-
-        if (ctx.get_macsec_sa() != nullptr)
-        {
-            return deleteMACsecSA(port_sci_an, SAI_MACSEC_DIRECTION_INGRESS);
-        }
-        else
-        {
-            // The MACsec SA hasn't been created.
-            // Don't need do anything until the active field to be enabled.
-            // To use "retry" because this message maybe include other initialized fields
-            // To use other return values will make us lose these initialized fields.
-            return task_need_retry;
+            ret = deleteMACsecSA(port_sci_an, SAI_MACSEC_DIRECTION_INGRESS);
+            sa.m_active = false;
         }
     }
+    return ret;
 }
 
 task_process_status MACsecOrch::taskDeleteIngressSA(
@@ -782,7 +853,28 @@ task_process_status MACsecOrch::taskDeleteIngressSA(
     const TaskArgs &sa_attr)
 {
     SWSS_LOG_ENTER();
-    return deleteMACsecSA(port_sci_an, SAI_MACSEC_DIRECTION_INGRESS);
+    auto ret = deleteMACsecSA(port_sci_an, SAI_MACSEC_DIRECTION_INGRESS);
+
+    std::string port_name;
+    sai_uint64_t sci = 0;
+    macsec_an_t an = 0;
+    if (!extract_variables(port_sci_an, ':', port_name, sci, an) || an > MAX_SA_NUMBER)
+    {
+        SWSS_LOG_WARN("The key %s isn't correct.", port_sci_an.c_str());
+        return task_failed;
+    }
+
+    MACsecOrchContext ctx(this, port_name, SAI_MACSEC_DIRECTION_INGRESS, sci, an);
+    if (ctx.get_macsec_sc() == nullptr)
+    {
+        SWSS_LOG_INFO("The MACsec SC 0x%" PRIx64 " hasn't been created at the port %s.", sci, port_name.c_str());
+    }
+    else
+    {
+        ctx.get_macsec_sc()->m_sas.erase();
+    }
+
+    return ret;
 }
 
 bool MACsecOrch::initMACsecObject(sai_object_id_t switch_id)
@@ -1541,7 +1633,7 @@ task_process_status MACsecOrch::deleteMACsecSC(
 
     auto result = task_success;
 
-    for (auto &sa : ctx.get_macsec_sc()->m_sa_ids)
+    for (auto &sa : ctx.get_macsec_sc()->m_sas)
     {
         const std::string port_sci_an = swss::join(':', port_sci, sa.first);
         deleteMACsecSA(port_sci_an, direction);
@@ -1708,7 +1800,15 @@ task_process_status MACsecOrch::createMACsecSA(
 
     // If this SA is the first SA
     // change the ACL entry action from packet action to MACsec flow
-    if (ctx.get_macsec_port()->m_enable && sc->m_sa_ids.empty())
+    size_t active_sa_count = 0;
+    for (auto &sa: ctx.get_macsec_sc()->sas)
+    {
+        if (sa.second.m_active)
+        {
+            active_sa_count++;
+        }
+    }
+    if (ctx.get_macsec_port()->m_enable && active_sa_count == 0)
     {
         if (!setMACsecFlowActive(sc->m_entry_id, sc->m_flow_id, true))
         {
@@ -1724,7 +1824,7 @@ task_process_status MACsecOrch::createMACsecSA(
     }
 
     if (!createMACsecSA(
-            sc->m_sa_ids[an],
+            sc->m_sas[an].m_sa_id,
             *ctx.get_switch_id(),
             direction,
             sc->m_sc_id,
@@ -1739,20 +1839,19 @@ task_process_status MACsecOrch::createMACsecSA(
         return task_failed;
     }
     recover.add_action([this, sc, an]() {
-        this->deleteMACsecSA(sc->m_sa_ids[an]);
-        sc->m_sa_ids.erase(an);
+        this->deleteMACsecSA(sc->m_sas[an].m_sa_id);
     });
 
     std::vector<FieldValueTuple> fvVector;
     fvVector.emplace_back("state", "ok");
     if (direction == SAI_MACSEC_DIRECTION_EGRESS)
     {
-        installCounter(CounterType::MACSEC_SA_ATTR, port_sci_an, sc->m_sa_ids[an], macsec_egress_sa_attrs);
+        installCounter(CounterType::MACSEC_SA_ATTR, port_sci_an, sc->m_sas[an].m_sa_id, macsec_egress_sa_attrs);
         m_state_macsec_egress_sa.set(swss::join('|', port_name, sci, an), fvVector);
     }
     else
     {
-        installCounter(CounterType::MACSEC_SA_ATTR, port_sci_an, sc->m_sa_ids[an], macsec_ingress_sa_attrs);
+        installCounter(CounterType::MACSEC_SA_ATTR, port_sci_an, sc->m_sas[an].m_sa_id, macsec_ingress_sa_attrs);
         m_state_macsec_ingress_sa.set(swss::join('|', port_name, sci, an), fvVector);
     }
 
@@ -1787,17 +1886,24 @@ task_process_status MACsecOrch::deleteMACsecSA(
 
     auto result = task_success;
 
-    uninstallCounter(port_sci_an, ctx.get_macsec_sc()->m_sa_ids[an]);
-    if (!deleteMACsecSA(ctx.get_macsec_sc()->m_sa_ids[an]))
+    uninstallCounter(port_sci_an, ctx.get_macsec_sc()->m_sas[an].m_sa_id);
+    if (!deleteMACsecSA(ctx.get_macsec_sc()->m_sas[an].m_sa_id))
     {
         SWSS_LOG_WARN("Cannot delete the MACsec SA %s.", port_sci_an.c_str());
         result = task_failed;
     }
-    ctx.get_macsec_sc()->m_sa_ids.erase(an);
 
     // If this SA is the last SA
     // change the ACL entry action from MACsec flow to packet action
-    if (ctx.get_macsec_sc()->m_sa_ids.empty())
+    size_t active_sa_count = 0;
+    for (auto &sa: ctx.get_macsec_sc()->sas)
+    {
+        if (sa.second.m_active)
+        {
+            active_sa_count++;
+        }
+    }
+    if (active_sa_count == 1)
     {
         if (!setMACsecFlowActive(ctx.get_macsec_sc()->m_entry_id, ctx.get_macsec_sc()->m_flow_id, false))
         {

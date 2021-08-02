@@ -71,11 +71,17 @@ private:
         sai_object_id_t         m_eapol_packet_forward_entry_id;
         std::set<sai_uint32_t>  m_available_acl_priorities;
     };
+    struct MACsecSA
+    {
+        bool            m_active;
+        TaskArgs        m_attrs;
+        sai_object_id_t m_sa_id;
+    };
     struct MACsecSC
     {
         macsec_an_t                             m_encoding_an;
         sai_object_id_t                         m_sc_id;
-        std::map<macsec_an_t, sai_object_id_t>  m_sa_ids;
+        std::map<macsec_an_t, MACsecSA>         m_sas; //m_sa_ids;
         sai_object_id_t                         m_flow_id;
         sai_object_id_t                         m_entry_id;
         sai_uint32_t                            m_acl_priority;
