@@ -12,6 +12,11 @@ edition.workspace = true
 # Async runtime
 tokio = { workspace = true }
 
+# Local columnar storage
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+parquet = { workspace = true }
+
 # Configuration and serialization
 yaml-rust = { workspace = true }
 
@@ -94,4 +99,8 @@ harness = false
 
 [[bench]]
 name = "aggregator_perf"
+harness = false
+
+[[bench]]
+name = "local_storage_perf"
 harness = false

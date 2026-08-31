@@ -1,6 +1,7 @@
 pub mod buffer;
 pub mod aggregator;
 pub mod ipfix;
+pub mod local_storage;
 pub mod netlink;
 pub mod saistats;
 
