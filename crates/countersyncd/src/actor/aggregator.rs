@@ -1,7 +1,7 @@
 use ahash::{HashMap, HashMapExt};
-use log::{debug, error};
+use log::{debug, error, info, warn};
 use std::collections::{HashSet, LinkedList};
-use std::sync::Arc;
+use std::sync::{mpsc::SyncSender, Arc};
 use tokio::{
     select,
     sync::mpsc::{Receiver, Sender},
@@ -13,6 +13,7 @@ use crate::message::{
         CounterSelector, Heatmap, HeatmapLayout, HeatmapQuantity, HeatmapValueKind,
         DEFAULT_ROLLOVER_BIT_WIDTH,
     },
+    local_storage::{LocalStorageMessage, LocalStorageStatus},
     saistats::{SAIStat, SAIStats, SAIStatsMessage},
 };
 
@@ -688,13 +689,13 @@ impl AggregatorState {
         })
     }
 
+    #[allow(dead_code)]
     fn process(&mut self, sample: SAIStatsMessage) -> Option<AggregatedStatsMessage> {
         let mut sample = sample;
 
         if let Some(rollover) = self.rollover.as_mut() {
             sample = rollover.process(sample);
         }
-
         let (heatmap_values, heatmap_time) = if let Some(reporting) = self.reporting.as_mut() {
             let Some(reported) = reporting.process(sample.as_ref()) else {
                 return None;
@@ -717,15 +718,22 @@ impl AggregatorState {
 }
 
 impl Aggregator {
+    #[allow(dead_code)]
     pub fn set_config(&mut self, key: String, config: Option<AggregatorConfig>) {
         self.update_config(key, config, false);
     }
 
+    #[allow(dead_code)]
     pub fn replace_config(&mut self, key: String, config: Option<AggregatorConfig>) {
         self.update_config(key, config, true);
     }
 
-    fn update_config(&mut self, key: String, config: Option<AggregatorConfig>, reset: bool) {
+    fn update_config(
+        &mut self,
+        key: String,
+        config: Option<AggregatorConfig>,
+        reset: bool,
+    ) -> bool {
         match config {
             Some(mut config) => {
                 let resolved = if config.layouts_are_resolved() {
@@ -738,14 +746,14 @@ impl Aggregator {
                         "Rejecting aggregator config for session {}: {}",
                         key, reason
                     );
-                    return;
+                    return false;
                 }
                 config
                     .rollover_bit_width_overrides
                     .retain(|_, bit_width| *bit_width != DEFAULT_ROLLOVER_BIT_WIDTH);
                 if let Some(state) = self.sessions.get_mut(&key) {
                     if !reset && state.config == config {
-                        return;
+                        return false;
                     }
 
                     let mut replacement = match AggregatorState::new(config) {
@@ -755,7 +763,7 @@ impl Aggregator {
                                 "Rejecting aggregator config for session {}: {}",
                                 key, reason
                             );
-                            return;
+                            return false;
                         }
                     };
                     if !reset {
@@ -768,23 +776,26 @@ impl Aggregator {
                     // Partial reporting and heatmap windows are intentionally
                     // discarded when their configuration changes.
                     *state = replacement;
+                    true
                 } else {
                     match AggregatorState::new(config) {
                         Ok(state) => {
                             self.sessions.insert(key, state);
+                            true
                         }
                         Err(reason) => {
                             error!(
                                 "Rejecting aggregator config for session {}: {}",
                                 key, reason
                             );
+                            false
                         }
                     }
                 }
             }
             None => {
                 // Removing a session discards any partial reporting or heatmap window.
-                self.sessions.remove(&key);
+                self.sessions.remove(&key).is_some()
             }
         }
     }
@@ -794,6 +805,7 @@ impl Aggregator {
         self.sessions.remove(key);
     }
 
+    #[allow(dead_code)]
     pub fn process(
         &mut self,
         key: Option<Arc<str>>,
@@ -818,6 +830,10 @@ pub struct AggregatorActor {
     config_recipient: Receiver<AggregatorConfigMessage>,
     stats_recipient: Receiver<AggregatedStatsMessage>,
     recipients: LinkedList<Sender<AggregatedStatsMessage>>,
+    local_storage_recipient: Option<SyncSender<LocalStorageMessage>>,
+    local_storage_status: Option<LocalStorageStatus>,
+    local_storage_accepted: u64,
+    local_storage_dropped: u64,
     aggregator: Aggregator,
 }
 
@@ -830,6 +846,10 @@ impl AggregatorActor {
             config_recipient,
             stats_recipient,
             recipients: LinkedList::new(),
+            local_storage_recipient: None,
+            local_storage_status: None,
+            local_storage_accepted: 0,
+            local_storage_dropped: 0,
             aggregator: Aggregator::default(),
         }
     }
@@ -843,9 +863,85 @@ impl AggregatorActor {
         self.recipients.push_back(recipient);
     }
 
+    pub fn set_local_storage_recipient(
+        &mut self,
+        recipient: SyncSender<LocalStorageMessage>,
+        status: LocalStorageStatus,
+    ) {
+        self.local_storage_recipient = Some(recipient);
+        self.local_storage_status = Some(status);
+    }
+
+    fn try_send_local(&mut self, message: LocalStorageMessage) {
+        if self
+            .local_storage_status
+            .as_ref()
+            .is_some_and(LocalStorageStatus::failed)
+        {
+            warn!("Local storage writer failed; disabling local storage output");
+            self.local_storage_recipient = None;
+            self.local_storage_status = None;
+            return;
+        }
+        let Some(recipient) = self.local_storage_recipient.as_ref() else {
+            return;
+        };
+        match recipient.try_send(message) {
+            Ok(()) => {
+                self.local_storage_accepted = self.local_storage_accepted.saturating_add(1);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.local_storage_dropped = self.local_storage_dropped.saturating_add(1);
+                if let Some(status) = &self.local_storage_status {
+                    status.record_input_drop();
+                }
+                if self.local_storage_dropped.is_power_of_two() {
+                    warn!(
+                        "Local storage queue full; dropped {} messages",
+                        self.local_storage_dropped
+                    );
+                }
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                warn!("Local storage channel closed; disabling local storage output");
+                self.local_storage_recipient = None;
+                self.local_storage_status = None;
+            }
+        }
+    }
+
+    fn try_send_local_control(&mut self, message: LocalStorageMessage) {
+        let Some(recipient) = self.local_storage_recipient.as_ref() else {
+            return;
+        };
+        match recipient.try_send(message) {
+            Ok(()) => {
+                self.local_storage_accepted = self.local_storage_accepted.saturating_add(1);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.local_storage_dropped = self.local_storage_dropped.saturating_add(1);
+                if let Some(status) = &self.local_storage_status {
+                    status.record_input_drop();
+                }
+                error!(
+                    "Disabling local storage because a session control message could not be queued"
+                );
+                self.local_storage_recipient = None;
+                self.local_storage_status = None;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                warn!("Local storage channel closed; disabling local storage output");
+                self.local_storage_recipient = None;
+                self.local_storage_status = None;
+            }
+        }
+    }
+
     fn handle_config(&mut self, message: AggregatorConfigMessage) {
         if message.is_delete {
+            let key = Arc::from(message.key.as_str());
             self.aggregator.remove_config(&message.key);
+            self.try_send_local_control(LocalStorageMessage::RemoveSession { key });
             return;
         }
 
@@ -859,29 +955,58 @@ impl AggregatorActor {
                 message.key
             );
         }
-        if message.reset {
-            self.aggregator.replace_config(message.key, message.config);
-        } else {
-            self.aggregator.set_config(message.key, message.config);
+        let expected_interval_us = message
+            .config
+            .as_ref()
+            .and_then(|config| config.poll_interval_us);
+        let key = Arc::from(message.key.as_str());
+        let reset_without_aggregator = message.reset && message.config.is_none();
+        let changed = self
+            .aggregator
+            .update_config(message.key, message.config, message.reset);
+        if changed || reset_without_aggregator {
+            self.try_send_local_control(LocalStorageMessage::ResetSession {
+                key,
+                expected_interval_us,
+            });
         }
     }
 
-    fn handle_stats(
+    #[cfg(test)]
+    fn handle_stats(&mut self, message: AggregatedStatsMessage) -> Option<AggregatedStatsMessage> {
+        self.handle_stats_with_local(message).1
+    }
+
+    fn handle_stats_with_local(
         &mut self,
         mut message: AggregatedStatsMessage,
-    ) -> Option<AggregatedStatsMessage> {
+    ) -> (Option<LocalStorageMessage>, Option<AggregatedStatsMessage>) {
         if let Some(config) = message.config.take() {
             self.handle_config(config);
-            return None;
+            return (None, None);
         }
 
         // A heatmap-bearing envelope is already aggregator output. Preserve it
         // unchanged if a downstream message is ever recirculated through here.
         if !message.heatmaps.is_empty() {
-            return Some(message);
+            return (None, Some(message));
         }
 
-        self.aggregator.process(message.key, message.stats)
+        let key = message.key;
+        let source_template_id = message.source_template_id;
+        let local_stats = self
+            .local_storage_recipient
+            .is_some()
+            .then(|| message.stats.clone());
+        let output = self.aggregator.process(key.clone(), message.stats);
+        (
+            local_stats.map(|stats| LocalStorageMessage::Gauge {
+                key,
+                source_template_id,
+                stats,
+            }),
+            output,
+        )
     }
 
     pub async fn run(mut actor: AggregatorActor) {
@@ -901,7 +1026,17 @@ impl AggregatorActor {
                 stats = actor.stats_recipient.recv() => {
                     match stats {
                         Some(stats) => {
-                            if let Some(message) = actor.handle_stats(stats) {
+                            let (local_gauge, output) = actor.handle_stats_with_local(stats);
+                            if let Some(local_gauge) = local_gauge {
+                                actor.try_send_local(local_gauge);
+                            }
+                            if let Some(message) = output {
+                                if !message.heatmaps.is_empty() {
+                                    actor.try_send_local(LocalStorageMessage::Heatmaps {
+                                        key: message.key.clone(),
+                                        heatmaps: message.heatmaps.clone(),
+                                    });
+                                }
                                 // Await bounded sinks intentionally: enabled
                                 // consumers share end-to-end backpressure and
                                 // the daemon's critical failure domain.
@@ -917,6 +1052,12 @@ impl AggregatorActor {
                     }
                 }
             }
+        }
+        if actor.local_storage_recipient.is_some() {
+            info!(
+                "Local storage delivery summary: accepted={}, dropped={}",
+                actor.local_storage_accepted, actor.local_storage_dropped
+            );
         }
     }
 }
@@ -2336,5 +2477,69 @@ mod tests {
         assert_eq!(output.key.as_deref(), Some("session"));
         assert_eq!(output.stats, stats);
         assert_eq!(output.heatmaps.as_ref(), &[heatmap]);
+    }
+
+    #[tokio::test]
+    async fn full_local_storage_queue_does_not_block_critical_recipient() {
+        let (_config_sender, config_receiver) = tokio::sync::mpsc::channel(1);
+        let (stats_sender, stats_receiver) = tokio::sync::mpsc::channel(2);
+        let (critical_sender, mut critical_receiver) = tokio::sync::mpsc::channel(2);
+        let (local_sender, _local_receiver) = std::sync::mpsc::sync_channel(1);
+        local_sender
+            .try_send(LocalStorageMessage::Gauge {
+                key: None,
+                source_template_id: None,
+                stats: sample(0, Vec::new()),
+            })
+            .unwrap();
+
+        let tracker = LocalStorageStatus::default();
+        let mut actor = AggregatorActor::new(config_receiver, stats_receiver);
+        actor.add_recipient(critical_sender);
+        actor.set_local_storage_recipient(local_sender, tracker.clone());
+        let handle = tokio::spawn(AggregatorActor::run(actor));
+
+        stats_sender.send(actor_stats(1_000, 10)).await.unwrap();
+        let output = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            critical_receiver.recv(),
+        )
+        .await
+        .expect("critical recipient should not be blocked")
+        .expect("critical recipient should remain open");
+        assert_eq!(output.stats.stats[0].counter, 10);
+        assert_eq!(tracker.take_input_drops(), 1);
+
+        drop(stats_sender);
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn equal_config_does_not_reset_local_storage_ranges() {
+        let (config_sender, config_receiver) = tokio::sync::mpsc::channel(1);
+        let (_stats_sender, stats_receiver) = tokio::sync::mpsc::channel(1);
+        let (local_sender, local_receiver) = std::sync::mpsc::sync_channel(2);
+        let mut actor = AggregatorActor::new(config_receiver, stats_receiver);
+        actor.set_local_storage_recipient(local_sender, LocalStorageStatus::default());
+        let config = stateful_config();
+
+        actor.handle_config(AggregatorConfigMessage::new(
+            "session".to_string(),
+            Some(config.clone()),
+        ));
+        assert!(matches!(
+            local_receiver.try_recv().unwrap(),
+            LocalStorageMessage::ResetSession { .. }
+        ));
+
+        actor.handle_config(AggregatorConfigMessage::new(
+            "session".to_string(),
+            Some(config),
+        ));
+        assert!(matches!(
+            local_receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(config_sender);
     }
 }

@@ -475,6 +475,52 @@ impl IpfixCache {
 
 type IpfixCacheRef = Rc<RefCell<IpfixCache>>;
 
+#[derive(Clone)]
+struct StatFieldLayout {
+    key: DataRecordKey,
+    object_name: String,
+    type_id: u32,
+    stat_id: u32,
+}
+
+fn stat_identity(
+    field_spec: &ipfixrw::parser::FieldSpecifier,
+    object_name_lookup: Option<&HashMap<u16, String>>,
+) -> (String, u32, u32) {
+    const EXTENSIONS_RANGE_BASE: u32 = 0x2000_0000;
+    let enterprise_number = field_spec.enterprise_number.unwrap_or(0);
+    let mut type_id = (enterprise_number & 0x7FFF_0000) >> 16;
+    let mut stat_id = enterprise_number & 0x0000_7FFF;
+    if enterprise_number & 0x8000_0000 != 0 {
+        type_id = type_id.saturating_add(EXTENSIONS_RANGE_BASE);
+    }
+    if enterprise_number & 0x0000_8000 != 0 {
+        stat_id = stat_id.saturating_add(EXTENSIONS_RANGE_BASE);
+    }
+    let label = field_spec.information_element_identifier;
+    let object_name = object_name_lookup
+        .and_then(|lookup| lookup.get(&label))
+        .cloned()
+        .unwrap_or_else(|| format!("unknown_{}", label));
+    (object_name, type_id, stat_id)
+}
+
+fn counter_value(value: &DataRecordValue) -> u64 {
+    match value {
+        DataRecordValue::Bytes(bytes) if bytes.len() >= 8 => NetworkEndian::read_u64(bytes),
+        DataRecordValue::Bytes(bytes) => {
+            let mut padded = [0u8; 8];
+            padded[8 - bytes.len()..].copy_from_slice(bytes);
+            NetworkEndian::read_u64(&padded)
+        }
+        DataRecordValue::U64(value) => *value,
+        DataRecordValue::U32(value) => u64::from(*value),
+        DataRecordValue::U16(value) => u64::from(*value),
+        DataRecordValue::U8(value) => u64::from(*value),
+        _ => 0,
+    }
+}
+
 /// Actor responsible for processing IPFIX messages and converting them to SAI statistics.
 ///
 /// The IpfixActor handles:
@@ -497,6 +543,10 @@ pub struct IpfixActor {
     applied_template_key_map: HashMap<u16, Arc<str>>,
     /// Precomputed lookup from object ID/label to object name for O(1) stat resolution
     object_id_name_map: HashMap<String, HashMap<u16, String>>,
+    /// Counter fields in template order. DataRecord itself is a HashMap, so
+    /// iterating it would make the downstream series order unstable.
+    template_stat_layouts: HashMap<u16, Arc<[StatFieldLayout]>>,
+    stable_output_order: bool,
 }
 
 impl IpfixActor {
@@ -522,6 +572,8 @@ impl IpfixActor {
             applied_templates_map: HashMap::new(),
             applied_template_key_map: HashMap::new(),
             object_id_name_map: HashMap::new(),
+            template_stat_layouts: HashMap::new(),
+            stable_output_order: false,
         }
     }
 
@@ -534,6 +586,10 @@ impl IpfixActor {
         self.saistats_recipients.push_back(recipient);
     }
 
+    pub fn enable_stable_output_order(&mut self) {
+        self.stable_output_order = true;
+    }
+
     /// Stores template information temporarily until it's applied to actual data.
     ///
     /// # Arguments
@@ -542,9 +598,29 @@ impl IpfixActor {
     /// * `templates` - Parsed IPFIX template message containing template definitions
     fn insert_temporary_template(&mut self, msg_key: &str, templates: Message) {
         let msg_key = Arc::<str>::from(msg_key);
+        let object_name_lookup = self.object_id_name_map.get(msg_key.as_ref());
         templates.iter_template_records().for_each(|record| {
             self.temporary_templates_map
                 .insert(record.template_id, msg_key.clone());
+            if self.stable_output_order {
+                let layout = record
+                    .field_specifiers
+                    .iter()
+                    .filter(|field| !is_observation_time_field(field))
+                    .map(|field| {
+                        let (object_name, type_id, stat_id) =
+                            stat_identity(field, object_name_lookup);
+                        StatFieldLayout {
+                            key: DataRecordKey::Unrecognized(field.clone()),
+                            object_name,
+                            type_id,
+                            stat_id,
+                        }
+                    })
+                    .collect::<Arc<[_]>>();
+                self.template_stat_layouts
+                    .insert(record.template_id, layout);
+            }
         });
     }
 
@@ -740,14 +816,22 @@ impl IpfixActor {
     fn handle_template_deletion(&mut self, key: &str) {
         debug!("Handling template deletion for key: {}", key);
 
+        let mut removed_template_ids = self
+            .temporary_templates_map
+            .iter()
+            .filter_map(|(template_id, msg_key)| (msg_key.as_ref() == key).then_some(*template_id))
+            .collect::<Vec<_>>();
+
         // Remove from applied templates map and get template IDs
         if let Some(template_ids) = self.applied_templates_map.remove(key) {
+            let removed_count = template_ids.len();
             // Remove from temporary templates map
             for template_id in &template_ids {
                 self.temporary_templates_map.remove(template_id);
                 self.applied_template_key_map.remove(template_id);
             }
-            debug!("Removed {} templates for key: {}", template_ids.len(), key);
+            removed_template_ids.extend(template_ids);
+            debug!("Removed {} templates for key: {}", removed_count, key);
         }
 
         // Also check and remove any remaining entries in temporary_templates_map
@@ -755,10 +839,12 @@ impl IpfixActor {
             .retain(|_, msg_key| msg_key.as_ref() != key);
         self.applied_template_key_map
             .retain(|_, msg_key| msg_key.as_ref() != key);
+        for template_id in removed_template_ids {
+            self.template_stat_layouts.remove(&template_id);
+        }
 
         // Remove object metadata for this key
         self.object_id_name_map.remove(key);
-
         debug!("Template deletion completed for key: {}", key);
     }
 
@@ -802,6 +888,13 @@ impl IpfixActor {
             let len = get_ipfix_message_length(&records[read_size..]);
             let len = match len {
                 Ok(len) => {
+                    if len < 16 {
+                        warn!(
+                            "Invalid IPFIX message length: {} at offset {}, expected at least 16",
+                            len, read_size
+                        );
+                        break;
+                    }
                     if len as usize + read_size > records.len() {
                         warn!(
                             "Invalid IPFIX message length: {} at offset {}, exceeds buffer size {}",
@@ -869,6 +962,7 @@ impl IpfixActor {
                 let object_name_lookup =
                     template_key.and_then(|key| self.object_id_name_map.get(key.as_ref()));
                 let template_key = template_key.cloned();
+                let stat_layout = self.template_stat_layouts.get(&template_id).cloned();
 
                 let mut observation_time: Option<u64>;
 
@@ -897,74 +991,87 @@ impl IpfixActor {
                         continue;
                     }
 
-                    // Collect final stats directly
-                    let mut final_stats: Vec<SAIStat> = Vec::new();
-
-                    // Debug: Log all fields in the record to understand what we're getting
-                    debug!(
-                        "Processing record for template_id {} with {} fields:",
-                        template_id,
-                        record.values.len()
+                    let mut final_stats = Vec::with_capacity(
+                        stat_layout
+                            .as_ref()
+                            .map_or(record.values.len(), |layout| layout.len()),
                     );
-                    for (key, val) in record.values.iter() {
-                        match key {
-                            DataRecordKey::Unrecognized(field_spec) => {
-                                debug!(
-                                    "  Field ID: {}, Enterprise: {:?}, Length: {}, Value: {:?}",
-                                    field_spec.information_element_identifier,
-                                    field_spec.enterprise_number,
-                                    field_spec.field_length,
-                                    val
-                                );
-                            }
-                            _ => {
-                                debug!("  Key: {:?}, Value: {:?}", key, val);
+
+                    if log::log_enabled!(log::Level::Debug) {
+                        debug!(
+                            "Processing record for template_id {} with {} fields:",
+                            template_id,
+                            record.values.len()
+                        );
+                        for (key, val) in record.values.iter() {
+                            match key {
+                                DataRecordKey::Unrecognized(field_spec) => {
+                                    debug!(
+                                        "  Field ID: {}, Enterprise: {:?}, Length: {}, Value: {:?}",
+                                        field_spec.information_element_identifier,
+                                        field_spec.enterprise_number,
+                                        field_spec.field_length,
+                                        val
+                                    );
+                                }
+                                _ => {
+                                    debug!("  Key: {:?}, Value: {:?}", key, val);
+                                }
                             }
                         }
                     }
 
-                    for (key, val) in record.values.iter() {
-                        // Check if this is the observation time field or system time field
-                        let is_time_field = match key {
-                            DataRecordKey::Unrecognized(field_spec) => {
-                                let field_id = field_spec.information_element_identifier;
-                                let is_standard_field = field_spec.enterprise_number.is_none();
-
-                                (field_id == OBSERVATION_TIME_NANOSECONDS
-                                    || field_id == OBSERVATION_TIME_SECONDS)
-                                    && is_standard_field
-                            }
-                            _ => false,
-                        };
-
-                        if is_time_field {
-                            if let DataRecordKey::Unrecognized(field_spec) = key {
-                                debug!(
-                                    "Skipping time field (ID: {})",
-                                    field_spec.information_element_identifier
-                                );
-                            }
+                    if let Some(layout) = stat_layout.as_ref() {
+                        if layout
+                            .iter()
+                            .any(|field| !record.values.contains_key(&field.key))
+                        {
+                            warn!(
+                                "Dropping incomplete IPFIX record for template {}: expected {} counter fields, found {} total fields",
+                                template_id,
+                                layout.len(),
+                                record.values.len()
+                            );
                             continue;
                         }
-
-                        match key {
-                            DataRecordKey::Unrecognized(field_spec) => {
-                                let stat = SAIStat::from_ipfix(field_spec, val, object_name_lookup);
-                                debug!("Created SAIStat: {:?}", stat);
-                                final_stats.push(stat);
+                        for field in layout.iter() {
+                            let value = record
+                                .values
+                                .get(&field.key)
+                                .expect("validated template field should exist");
+                            final_stats.push(SAIStat {
+                                object_name: field.object_name.clone(),
+                                type_id: field.type_id,
+                                stat_id: field.stat_id,
+                                counter: counter_value(value),
+                            });
+                        }
+                    } else {
+                        for (key, val) in record.values.iter() {
+                            let DataRecordKey::Unrecognized(field_spec) = key else {
+                                continue;
+                            };
+                            if is_observation_time_field(field_spec) {
+                                continue;
                             }
-                            _ => continue,
+                            final_stats.push(SAIStat::from_ipfix(
+                                field_spec,
+                                val,
+                                object_name_lookup,
+                            ));
                         }
                     }
 
-                    let saistats = SAIStatsMessage::new(SAIStats {
-                        observation_time: observation_time
-                            .expect("observation_time should be Some at this point"),
-                        stats: final_stats,
-                    });
+                    let saistats = SAIStatsMessage::new(SAIStats::new(
+                        observation_time.expect("observation_time should be Some at this point"),
+                        final_stats,
+                    ));
 
                     debug!("Record parsed {:?}", saistats);
-                    messages.push(AggregatedStatsMessage::new(template_key.clone(), saistats));
+                    messages.push(
+                        AggregatedStatsMessage::new(template_key.clone(), saistats)
+                            .with_source_template_id(template_id),
+                    );
                 }
             }
             read_size += len as usize;
@@ -1061,6 +1168,12 @@ const OBSERVATION_TIME_NANOSECONDS: u16 = 325;
 /// - Semantics: default
 /// - Status: current
 const OBSERVATION_TIME_SECONDS: u16 = 322;
+
+fn is_observation_time_field(field_spec: &ipfixrw::parser::FieldSpecifier) -> bool {
+    field_spec.enterprise_number.is_none()
+        && (field_spec.information_element_identifier == OBSERVATION_TIME_NANOSECONDS
+            || field_spec.information_element_identifier == OBSERVATION_TIME_SECONDS)
+}
 
 /// Extracts observation time from an IPFIX data record.
 ///
@@ -1336,6 +1449,41 @@ mod test {
             saw_session_b,
             "did not observe any stats for session B/template 257"
         );
+    }
+
+    #[test]
+    fn stable_output_uses_template_field_order() {
+        let (_template_sender, template_receiver) = tokio::sync::mpsc::channel(1);
+        let (_buffer_sender, buffer_receiver) = tokio::sync::mpsc::channel(1);
+        let mut actor = IpfixActor::new(template_receiver, buffer_receiver);
+        actor.enable_stable_output_order();
+
+        let template_bytes: [u8; 44] = [
+            0x00, 0x0A, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x1C, 0x01, 0x00, 0x00, 0x03, 0x01, 0x45, 0x00, 0x08,
+            0x80, 0x02, 0x00, 0x08, 0x80, 0x03, 0x80, 0x04, 0x80, 0x01, 0x00, 0x08, 0x00, 0x01,
+            0x00, 0x02,
+        ];
+        actor.handle_template(IPFixTemplatesMessage::new(
+            "session|PORT".to_string(),
+            Arc::new(Vec::from(template_bytes)),
+            Some(vec!["Ethernet0".to_string(), "Ethernet1".to_string()]),
+            Some(vec![1, 2]),
+        ));
+
+        let records: [u8; 44] = [
+            0x00, 0x0A, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x03,
+        ];
+        let messages = actor.handle_record(Arc::new(Vec::from(records)));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].source_template_id, Some(256));
+        assert_eq!(messages[0].stats.stats[0].object_name, "Ethernet1");
+        assert_eq!(messages[0].stats.stats[0].counter, 7);
+        assert_eq!(messages[0].stats.stats[1].object_name, "Ethernet0");
+        assert_eq!(messages[0].stats.stats[1].counter, 3);
     }
 
     #[test]
@@ -1618,14 +1766,15 @@ mod test {
 
         template_sender
             .send(IPFixTemplatesMessage::config(
-                AggregatorConfigMessage::replacement(
-                "session|PORT".to_string(),
-                None,
-            )))
+                AggregatorConfigMessage::replacement("session|PORT".to_string(), None),
+            ))
             .await
             .unwrap();
 
-        let control = stats_receiver.recv().await.expect("config control envelope");
+        let control = stats_receiver
+            .recv()
+            .await
+            .expect("config control envelope");
         assert!(control.config.is_some_and(|config| config.reset));
 
         drop(template_sender);

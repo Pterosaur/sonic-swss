@@ -3,6 +3,7 @@ pub mod counter_db;
 pub mod data_netlink;
 pub mod aggregator;
 pub mod ipfix;
+pub mod local_storage;
 pub mod netlink_utils;
 pub mod stats_reporter;
 pub mod swss;

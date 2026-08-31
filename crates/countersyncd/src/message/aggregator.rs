@@ -678,6 +678,7 @@ impl AggregatorConfigMessage {
 #[derive(Debug, Clone)]
 pub struct StatsMessage {
     pub key: Option<Arc<str>>,
+    pub source_template_id: Option<u16>,
     pub stats: SAIStatsMessage,
     pub heatmaps: Arc<[Heatmap]>,
     pub config: Option<AggregatorConfigMessage>,
@@ -709,6 +710,7 @@ impl StatsMessage {
     pub fn new(key: Option<Arc<str>>, stats: SAIStatsMessage) -> Self {
         Self {
             key,
+            source_template_id: None,
             stats,
             heatmaps: empty_heatmaps(),
             config: None,
@@ -727,15 +729,22 @@ impl StatsMessage {
         };
         Self {
             key,
+            source_template_id: None,
             stats,
             heatmaps,
             config: None,
         }
     }
 
+    pub fn with_source_template_id(mut self, template_id: u16) -> Self {
+        self.source_template_id = Some(template_id);
+        self
+    }
+
     pub fn config(message: AggregatorConfigMessage) -> Self {
         Self {
             key: None,
+            source_template_id: None,
             stats: Arc::new(super::saistats::SAIStats::new(0, Vec::new())),
             heatmaps: empty_heatmaps(),
             config: Some(message),

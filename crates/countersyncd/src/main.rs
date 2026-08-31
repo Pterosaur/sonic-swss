@@ -13,19 +13,21 @@ use tokio::{spawn, sync::mpsc::channel};
 
 // Internal actor implementations
 use crate::actor::{
+    aggregator::AggregatorActor,
     control_netlink::ControlNetlinkActor,
     counter_db::{CounterDBActor, CounterDBConfig},
     data_netlink::{get_genl_family_group, DataNetlinkActor},
-    aggregator::AggregatorActor,
     ipfix::IpfixActor,
+    local_storage::{LocalStorageActor, LocalStorageConfig},
+    otel::{OtelActor, OtelActorConfig},
     stats_reporter::{ConsoleWriter, StatsReporterActor, StatsReporterConfig},
     swss::SwssActor,
-    otel::{OtelActor, OtelActorConfig},
 };
 
 // Internal exit codes
-use countersyncd::exit_codes::{EXIT_FAILURE, EXIT_OTEL_EXPORT_RETRIES_EXHAUSTED};
+use crate::message::local_storage::LocalStorageStatus;
 use crate::utilities::{set_comm_capacity, set_comm_log_interval_secs, ChannelLabel};
+use countersyncd::exit_codes::{EXIT_FAILURE, EXIT_OTEL_EXPORT_RETRIES_EXHAUSTED};
 
 /// Initialize logging based on command line arguments
 fn init_logging(log_level: &str, log_format: &str) {
@@ -307,6 +309,10 @@ struct Args {
         help = "Flush timeout (ms) for OTLP export batch"
     )]
     otel_flush_timeout_ms: u64,
+
+    /// Enable bounded local Parquet storage for HFT gauge ranges and heatmaps
+    #[arg(long, default_value = "false")]
+    enable_local_storage: bool,
 }
 
 #[tokio::main]
@@ -339,6 +345,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.otel_max_counters_per_export, args.otel_max_export_bytes, args.otel_flush_timeout_ms
         );
     }
+    info!("Local storage enabled: {}", args.enable_local_storage);
+    if args.enable_local_storage {
+        info!("Local storage: path=/mnt/hft, max_bytes=4000000000, range_interval_us=10000, shard_interval_secs=5");
+    }
     info!(
         "Comm stats log interval: {} seconds",
         args.comm_stats_interval
@@ -349,7 +359,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     info!(
         "Channel capacities - ipfix_records: {}, stats_reporter: {}, counter_db: {}, otel: {}",
-        args.data_netlink_capacity, args.stats_reporter_capacity, args.counter_db_capacity, args.otel_capacity
+        args.data_netlink_capacity,
+        args.stats_reporter_capacity,
+        args.counter_db_capacity,
+        args.otel_capacity
     );
 
     set_comm_log_interval_secs(args.comm_stats_interval);
@@ -362,12 +375,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (stats_report_sender, stats_report_receiver) = channel(args.stats_reporter_capacity);
     let (counter_db_sender, counter_db_receiver) = channel(args.counter_db_capacity);
     let (otel_sender, otel_receiver) = channel(args.otel_capacity);
+    let (local_storage_sender, local_storage_receiver) = std::sync::mpsc::sync_channel(1024);
     let (otel_shutdown_sender, _otel_shutdown_receiver) = tokio::sync::oneshot::channel();
 
     set_comm_capacity(ChannelLabel::ControlNetlinkToDataNetlink, 10);
-    set_comm_capacity(ChannelLabel::DataNetlinkToIpfixRecords, args.data_netlink_capacity);
+    set_comm_capacity(
+        ChannelLabel::DataNetlinkToIpfixRecords,
+        args.data_netlink_capacity,
+    );
     set_comm_capacity(ChannelLabel::SwssToIpfixTemplates, 10);
-    set_comm_capacity(ChannelLabel::IpfixToStatsReporter, args.stats_reporter_capacity);
+    set_comm_capacity(
+        ChannelLabel::IpfixToStatsReporter,
+        args.stats_reporter_capacity,
+    );
     set_comm_capacity(ChannelLabel::IpfixToCounterDb, args.counter_db_capacity);
     set_comm_capacity(ChannelLabel::IpfixToOtel, args.otel_capacity);
 
@@ -388,9 +408,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let control_netlink = ControlNetlinkActor::new(family.as_str(), command_sender);
 
     let mut ipfix = IpfixActor::new(ipfix_template_receiver, ipfix_record_receiver);
+    if args.enable_local_storage {
+        ipfix.enable_stable_output_order();
+    }
     ipfix.add_recipient(aggregator_stats_sender);
 
     let mut aggregator = AggregatorActor::new_without_config(aggregator_stats_receiver);
+
+    let (local_storage, local_storage_status) = if args.enable_local_storage {
+        let local_storage_status = LocalStorageStatus::default();
+        let local_storage_config = LocalStorageConfig {
+            root: "/mnt/hft".into(),
+            range_interval: Duration::from_millis(10),
+            shard_interval: Duration::from_secs(5),
+            max_bytes: 4_000_000_000,
+            require_dedicated_filesystem: true,
+        };
+        local_storage_config.validate_root()?;
+        aggregator.set_local_storage_recipient(
+            local_storage_sender.clone(),
+            local_storage_status.clone(),
+        );
+        (
+            Some(LocalStorageActor::new(
+                local_storage_receiver,
+                local_storage_config,
+                local_storage_status.clone(),
+            )?),
+            Some(local_storage_status),
+        )
+    } else {
+        drop(local_storage_receiver);
+        (None, None)
+    };
 
     // Initialize SwssActor to monitor SONiC orchestrator messages
     let swss = match SwssActor::new(ipfix_template_sender) {
@@ -548,7 +598,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // All actors are treated as critical. If any actor exits, abort the rest and terminate.
+    let mut local_storage_handle = local_storage.map(|actor| {
+        tokio::task::spawn_blocking(move || {
+            info!("Local storage actor started");
+            LocalStorageActor::run(actor);
+            info!("Local storage actor terminated");
+        })
+    });
+
+    let mut terminate_signal =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    // Local storage is best-effort and intentionally outside this critical set.
+    // A storage failure is reported through LocalStorageStatus and disables its tap.
     let first_exit = tokio::select! {
         res = &mut data_netlink_handle => {
             classify_join("Data netlink", res)
@@ -574,13 +636,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         res = async { otel_handle.as_mut().unwrap().await }, if otel_handle.is_some() => {
             classify_otel_join("OpenTelemetry", res)
         }
+        _ = tokio::signal::ctrl_c() => {
+            SupervisorExit {
+                actor_name: "SIGINT",
+                exit_code: 0,
+                message: "shutdown requested".to_string(),
+            }
+        }
+        _ = terminate_signal.recv() => {
+            SupervisorExit {
+                actor_name: "SIGTERM",
+                exit_code: 0,
+                message: "shutdown requested".to_string(),
+            }
+        }
     };
 
-    error!(
-        "Critical actor '{}' triggered daemon shutdown: {}",
-        first_exit.actor_name,
-        first_exit.message
-    );
+    if first_exit.exit_code == 0 {
+        info!("{}: {}", first_exit.actor_name, first_exit.message);
+    } else {
+        error!(
+            "Critical actor '{}' triggered daemon shutdown: {}",
+            first_exit.actor_name, first_exit.message
+        );
+    }
 
     data_netlink_handle.abort();
     control_netlink_handle.abort();
@@ -596,6 +675,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(handle) = otel_handle.as_mut() {
         handle.abort();
+    }
+    drop(aggregator_handle);
+    drop(local_storage_sender);
+    if let Some(mut handle) = local_storage_handle.take() {
+        match tokio::time::timeout(Duration::from_secs(10), &mut handle).await {
+            Ok(Ok(())) => info!("Local storage flushed before shutdown"),
+            Ok(Err(e)) => error!("Local storage task failed during shutdown: {}", e),
+            Err(_) => {
+                error!("Timed out waiting for local storage shutdown; forcing it to stop");
+                if let Some(status) = local_storage_status {
+                    status.request_shutdown();
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(1), &mut handle).await;
+            }
+        }
     }
 
     std::process::exit(first_exit.exit_code);
@@ -621,6 +715,7 @@ mod tests {
         assert!(!args.enable_stats);
         assert!(!args.enable_counter_db);
         assert!(!args.enable_otel);
+        assert!(!args.enable_local_storage);
     }
 
     #[test]
