@@ -8,7 +8,7 @@ mod utilities;
 use clap::Parser;
 use log::{error, info, warn};
 use opentelemetry::ExportError;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 use tokio::{spawn, sync::mpsc::channel};
 
 // Internal actor implementations
@@ -17,12 +17,14 @@ use crate::actor::{
     counter_db::{CounterDBActor, CounterDBConfig},
     data_netlink::{get_genl_family_group, DataNetlinkActor},
     ipfix::IpfixActor,
+    local_storage::{LocalStorageActor, LocalStorageConfig},
     otel::{OtelActor, OtelActorConfig},
     stats_reporter::{ConsoleWriter, StatsReporterActor, StatsReporterConfig},
     swss::SwssActor,
 };
 
 // Internal exit codes
+use crate::message::local_storage::LocalStorageStatus;
 use crate::utilities::{set_comm_capacity, set_comm_log_interval_secs, ChannelLabel};
 use countersyncd::exit_codes::{EXIT_FAILURE, EXIT_OTEL_EXPORT_RETRIES_EXHAUSTED};
 
@@ -313,6 +315,34 @@ struct Args {
         help = "Flush timeout (ms) for OTLP export batch"
     )]
     otel_flush_timeout_ms: u64,
+
+    /// Enable bounded raw UInt64 Arrow IPC streams with backpressure (100 ms batch flush)
+    #[arg(long, default_value = "false")]
+    enable_local_storage: bool,
+
+    /// Existing local storage directory (dedicated filesystem by default)
+    #[arg(long, default_value = "/mnt/hft")]
+    local_storage_root: PathBuf,
+
+    /// Local storage quota in bytes; must exceed the 64 MiB batch reserve
+    #[arg(
+        long,
+        default_value = "4000000000",
+        value_parser = clap::value_parser!(u64).range(67_108_865..)
+    )]
+    local_storage_max_bytes: u64,
+
+    /// Compressed IPC file byte target; rotate after a complete batch flush
+    #[arg(long, default_value = "100000000", value_parser = clap::value_parser!(u64).range(1..))]
+    local_storage_file_bytes: u64,
+
+    /// Maximum local storage file age in wall-clock seconds
+    #[arg(long, default_value = "1800", value_parser = clap::value_parser!(u64).range(1..))]
+    local_storage_file_seconds: u64,
+
+    /// Allow a shared filesystem for capture; other root safety checks still apply
+    #[arg(long, default_value = "false", requires = "enable_local_storage")]
+    local_storage_allow_shared_filesystem: bool,
 }
 
 impl Args {
@@ -332,6 +362,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging based on command line arguments
     init_logging(&args.log_level, &args.log_format);
     args.normalize_capacities();
+
+    let mut interrupt_signal =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut terminate_signal =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     if let Some(value) = args.socket_readiness_timeout_ms {
         warn!(
@@ -495,6 +530,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Setup failure disables only this optional sink. Keep the sole sender in
+    // IPFIX so aborting that actor closes the queue and starts a graceful drain.
+    let (local_storage, local_storage_status) = if args.enable_local_storage {
+        let status = LocalStorageStatus::default();
+        let config = LocalStorageConfig {
+            root: args.local_storage_root,
+            shard_interval: Duration::from_secs(args.local_storage_file_seconds),
+            file_target_bytes: args.local_storage_file_bytes,
+            max_bytes: args.local_storage_max_bytes,
+            require_dedicated_filesystem: !args.local_storage_allow_shared_filesystem,
+        };
+        // Flat messages hold many records; do not carry over PR7's 1024-sample queue.
+        let (sender, receiver) = channel(32);
+        ipfix.add_recipient(sender);
+        info!(
+            "Local storage requested: path={}, format=sonic-hft-arrow-v5, compression=zstd, max_bytes={}, require_dedicated_filesystem={}, file_target_bytes={}, shard_interval_secs={}, batch_flush_ms=100, queue_batches=32; capture applies backpressure",
+            config.root.display(),
+            config.max_bytes,
+            config.require_dedicated_filesystem,
+            config.file_target_bytes,
+            config.shard_interval.as_secs()
+        );
+        (Some((receiver, config, status.clone())), Some(status))
+    } else {
+        (None, None)
+    };
+
     info!("Starting actor tasks...");
 
     // Spawn actor tasks
@@ -559,7 +621,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // All actors are treated as critical. If any actor exits, abort the rest and terminate.
+    // Initialization includes filesystem traversal and fsync. It must not delay
+    // critical startup or the signal supervisor, even on a stalled mount. Until
+    // ready, the bounded queue applies backpressure; a setup error closes it.
+    let local_storage_handle = local_storage.map(|(receiver, config, status)| {
+        tokio::task::spawn_blocking(move || {
+            match LocalStorageActor::new(receiver, config, status) {
+                Ok(actor) => actor.run(),
+                Err(reason) => error!(
+                    "Local storage setup failed; continuing without local output: {}",
+                    reason
+                ),
+            }
+        })
+    });
+
+    // Local storage is optional and intentionally outside the critical set.
     let first_exit = tokio::select! {
         res = &mut data_netlink_handle => {
             classify_join("Data netlink", res)
@@ -582,12 +659,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         res = async { otel_handle.as_mut().unwrap().await }, if otel_handle.is_some() => {
             classify_otel_join("OpenTelemetry", res)
         }
+        _ = interrupt_signal.recv() => SupervisorExit {
+            actor_name: "SIGINT",
+            exit_code: 0,
+            message: "shutdown requested".to_string(),
+        },
+        _ = terminate_signal.recv() => SupervisorExit {
+            actor_name: "SIGTERM",
+            exit_code: 0,
+            message: "shutdown requested".to_string(),
+        },
     };
 
-    error!(
-        "Critical actor '{}' triggered daemon shutdown: {}",
-        first_exit.actor_name, first_exit.message
-    );
+    if first_exit.exit_code == 0 {
+        info!("{}: {}", first_exit.actor_name, first_exit.message);
+    } else {
+        error!(
+            "Critical actor '{}' triggered daemon shutdown: {}",
+            first_exit.actor_name, first_exit.message
+        );
+    }
 
     data_netlink_handle.abort();
     control_netlink_handle.abort();
@@ -604,6 +695,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handle.abort();
     }
 
+    if let Some(status) = &local_storage_status {
+        status.request_shutdown();
+    }
+    if let Some(mut handle) = local_storage_handle {
+        match tokio::time::timeout(Duration::from_secs(10), &mut handle).await {
+            Ok(Ok(())) => {
+                if local_storage_status
+                    .as_ref()
+                    .is_some_and(LocalStorageStatus::failed)
+                {
+                    error!("Local storage stopped with a failure; drain is incomplete");
+                } else {
+                    info!("Local storage flushed before shutdown");
+                }
+            }
+            Ok(Err(reason)) => error!("Local storage task failed: {}", reason),
+            Err(_) => {
+                error!("Timed out draining local storage; final data may be incomplete");
+            }
+        }
+    }
+
+    // Do not let a blocked filesystem operation hold Tokio runtime teardown open.
     std::process::exit(first_exit.exit_code);
 }
 
@@ -631,6 +745,96 @@ mod tests {
         assert!(!args.enable_stats);
         assert!(!args.enable_counter_db);
         assert!(!args.enable_otel);
+        assert!(!args.enable_local_storage);
+    }
+
+    #[test]
+    fn local_storage_is_opt_in() {
+        for enabled in [false, true] {
+            let argv = if enabled {
+                vec!["countersyncd", "--enable-local-storage"]
+            } else {
+                vec!["countersyncd"]
+            };
+            let args = parse(&argv).unwrap();
+            assert_eq!(args.enable_local_storage, enabled);
+            assert_eq!(args.local_storage_root, PathBuf::from("/mnt/hft"));
+            assert_eq!(args.local_storage_max_bytes, 4_000_000_000);
+            assert_eq!(args.local_storage_file_bytes, 100_000_000);
+            assert_eq!(args.local_storage_file_seconds, 1800);
+            assert!(!args.local_storage_allow_shared_filesystem);
+        }
+    }
+
+    #[test]
+    fn local_storage_explicit_options() {
+        let args = parse(&[
+            "countersyncd",
+            "--enable-local-storage",
+            "--local-storage-root",
+            "/mnt/dut capture",
+            "--local-storage-max-bytes",
+            "2400000000",
+            "--local-storage-file-bytes",
+            "2000000",
+            "--local-storage-file-seconds",
+            "60",
+            "--local-storage-allow-shared-filesystem",
+        ])
+        .unwrap();
+        assert!(args.enable_local_storage);
+        assert_eq!(args.local_storage_root, PathBuf::from("/mnt/dut capture"));
+        assert_eq!(args.local_storage_max_bytes, 2_400_000_000);
+        assert_eq!(args.local_storage_file_bytes, 2_000_000);
+        assert_eq!(args.local_storage_file_seconds, 60);
+        assert!(args.local_storage_allow_shared_filesystem);
+    }
+
+    #[test]
+    fn local_storage_quota_bounds() {
+        for (quota, valid) in [
+            ("0", false),
+            ("67108864", false),
+            ("67108865", true),
+            ("18446744073709551615", true),
+        ] {
+            assert_eq!(
+                parse(&[
+                    "countersyncd",
+                    "--enable-local-storage",
+                    "--local-storage-max-bytes",
+                    quota,
+                ])
+                .is_ok(),
+                valid,
+                "quota={quota}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_storage_rotation_bounds() {
+        for option in ["--local-storage-file-bytes", "--local-storage-file-seconds"] {
+            for (value, valid) in [
+                ("0", false),
+                ("-1", false),
+                ("invalid", false),
+                ("1", true),
+                ("18446744073709551615", true),
+                ("18446744073709551616", false),
+            ] {
+                let result = parse(&["countersyncd", option, value]);
+                assert_eq!(result.is_ok(), valid, "{option}={value}");
+                if let Ok(args) = result {
+                    assert!(!args.enable_local_storage);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_storage_shared_filesystem_requires_enable() {
+        assert!(parse(&["countersyncd", "--local-storage-allow-shared-filesystem",]).is_err());
     }
 
     #[test]
